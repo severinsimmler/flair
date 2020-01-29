@@ -113,11 +113,10 @@ class LanguageModel(nn.Module):
         padded_strings: List[str] = []
 
         for string in strings:
-            pad_by = len_longest_str - len(string)
             if not self.is_forward_lm:
                 string = string[::-1]
 
-            padded = f"{start_marker}{string}{end_marker}{pad_by * ' '}"
+            padded = f"{start_marker}{string}{end_marker}"
             padded_strings.append(padded)
 
         # cut up the input into chunks of max charlength = chunk_size
@@ -133,15 +132,16 @@ class LanguageModel(nn.Module):
         )
         hidden = self.init_hidden(len(chunks[0]))
 
+        padding_char_index = self.dictionary.get_idx_for_item(" ")
+
         batches: List[torch.Tensor] = []
         # push each chunk through the RNN language model
         for chunk in chunks:
-
+            len_longest_chunk: int = len(max(chunk, key=len))
             sequences_as_char_indices: List[List[int]] = []
             for string in chunk:
-                char_indices = [
-                    self.dictionary.get_idx_for_item(char) for char in string
-                ]
+                char_indices = self.dictionary.get_idx_for_items(list(string))
+                char_indices += [padding_char_index] * (len_longest_chunk - len(string))
 
                 sequences_as_char_indices.append(char_indices)
             t = torch.tensor(sequences_as_char_indices, dtype=torch.long).to(
@@ -176,7 +176,8 @@ class LanguageModel(nn.Module):
         else:
             return tuple(self.repackage_hidden(v) for v in h)
 
-    def initialize(self, matrix):
+    @staticmethod
+    def initialize(matrix):
         in_, out_ = matrix.size()
         stdv = math.sqrt(3.0 / (in_ + out_))
         matrix.detach().uniform_(-stdv, stdv)
@@ -354,8 +355,6 @@ class LanguageModel(nn.Module):
             if not self.is_forward_lm:
                 text = text[::-1]
 
-            text = text.encode("utf-8")
-
             return text, log_prob
 
     def calculate_perplexity(self, text: str) -> float:
@@ -389,3 +388,37 @@ class LanguageModel(nn.Module):
         perplexity = math.exp(loss)
 
         return perplexity
+
+    def _apply(self, fn):
+        major, minor, build, *_ = (int(info)
+                                for info in torch.__version__.replace("+cpu","").split('.'))
+
+        # fixed RNN change format for torch 1.4.0
+        if major >= 1 and minor >= 4:
+            for child_module in self.children():
+                if isinstance(child_module, torch.nn.RNNBase):
+                    _flat_weights_names = []
+                    num_direction = None
+
+                    if child_module.__dict__["bidirectional"]:
+                        num_direction = 2
+                    else:
+                        num_direction = 1
+                    for layer in range(child_module.__dict__["num_layers"]):
+                        for direction in range(num_direction):
+                            suffix = "_reverse" if direction == 1 else ""
+                            param_names = ["weight_ih_l{}{}", "weight_hh_l{}{}"]
+                            if child_module.__dict__["bias"]:
+                                param_names += ["bias_ih_l{}{}", "bias_hh_l{}{}"]
+                            param_names = [
+                                x.format(layer, suffix) for x in param_names
+                            ]
+                            _flat_weights_names.extend(param_names)
+
+                    setattr(child_module, "_flat_weights_names",
+                            _flat_weights_names)
+
+                child_module._apply(fn)
+
+        else:
+            super()._apply(fn)

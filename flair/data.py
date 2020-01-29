@@ -1,5 +1,7 @@
 from abc import abstractmethod
+from operator import itemgetter
 from typing import List, Dict, Union, Callable
+import re
 
 import torch, flair
 import logging
@@ -57,6 +59,25 @@ class Dictionary:
         else:
             return 0
 
+    def get_idx_for_items(self, items: List[str]) -> List[int]:
+        """
+        returns the IDs for each item of the list of string, otherwise 0 if not found
+        :param items: List of string for which IDs are requested
+        :return: List of ID of strings
+        """
+        if not hasattr(self, "item2idx_not_encoded"):
+            d = dict(
+                [(key.decode("UTF-8"), value) for key, value in self.item2idx.items()]
+            )
+            self.item2idx_not_encoded = defaultdict(int, d)
+
+        if not items:
+            return []
+        results = itemgetter(*items)(self.item2idx_not_encoded)
+        if isinstance(results, int):
+            return [results]
+        return list(results)
+
     def get_items(self) -> List[str]:
         items = []
         for item in self.idx2item:
@@ -98,7 +119,21 @@ class Dictionary:
             char_dict = cached_path(base_path, cache_dir="datasets")
             return Dictionary.load_from_file(char_dict)
 
+        if name == "chars-large" or name == "common-chars-large":
+            base_path = "https://s3.eu-central-1.amazonaws.com/alan-nlp/resources/models/common_characters_large"
+            char_dict = cached_path(base_path, cache_dir="datasets")
+            return Dictionary.load_from_file(char_dict)
+
+        if name == "chars-xl" or name == "common-chars-xl":
+            base_path = "https://s3.eu-central-1.amazonaws.com/alan-nlp/resources/models/common_characters_xl"
+            char_dict = cached_path(base_path, cache_dir="datasets")
+            return Dictionary.load_from_file(char_dict)
+
         return Dictionary.load_from_file(name)
+
+    def __str__(self):
+        tags = ', '.join(self.get_item_for_index(i) for i in range(min(len(self), 30)))
+        return f"Dictionary with {len(self)} tags: {tags}"
 
 
 class Label:
@@ -260,25 +295,21 @@ class Token(DataPoint):
                     del self._embeddings[name]
 
     def get_each_embedding(self) -> torch.tensor:
-        return [self._embeddings[embed] for embed in sorted(self._embeddings.keys())]
+        embeddings = []
+        for embed in sorted(self._embeddings.keys()):
+            embed = self._embeddings[embed].to(flair.device)
+            if (flair.embedding_storage_mode == "cpu") and embed.device != flair.device:
+                embed = embed.to(flair.device)
+            embeddings.append(embed)
+        return embeddings
 
     def get_embedding(self) -> torch.tensor:
-        embeddings = [
-            self._embeddings[embed] for embed in sorted(self._embeddings.keys())
-        ]
+        embeddings = self.get_each_embedding()
 
         if embeddings:
             return torch.cat(embeddings, dim=0)
 
         return torch.tensor([], device=flair.device)
-
-    def get_subembedding(self, names: List[str]) -> torch.tensor:
-        embeddings = [self._embeddings[embed] for embed in sorted(names)]
-
-        if embeddings:
-            return torch.cat(embeddings, dim=0)
-
-        return torch.Tensor()
 
     @property
     def start_position(self) -> int:
@@ -398,6 +429,73 @@ def space_tokenizer(text: str) -> List[Token]:
     return tokens
 
 
+def build_japanese_tokenizer(tokenizer: str = "MeCab"):
+    if tokenizer.lower() != "mecab":
+        raise NotImplementedError("Currently, MeCab is only supported.")
+
+    try:
+        import konoha
+    except ModuleNotFoundError:
+        log.warning("-" * 100)
+        log.warning('ATTENTION! The library "konoha" is not installed!')
+        log.warning(
+            'To use Japanese tokenizer, please first install with the following steps:'
+        )
+        log.warning(
+            '- Install mecab with "sudo apt install mecab libmecab-dev mecab-ipadic"'
+        )
+        log.warning('- Install konoha with "pip install konoha[mecab]"')
+        log.warning("-" * 100)
+        pass
+
+    sentence_tokenizer = konoha.SentenceTokenizer()
+    word_tokenizer = konoha.WordTokenizer(tokenizer)
+
+    def tokenizer(text: str) -> List[Token]:
+        """
+        Tokenizer using konoha, a third party library which supports
+        multiple Japanese tokenizer such as MeCab, KyTea and SudachiPy.
+        """
+        tokens: List[Token] = []
+        words: List[str] = []
+
+        sentences = sentence_tokenizer.tokenize(text)
+        for sentence in sentences:
+            konoha_tokens = word_tokenizer.tokenize(sentence)
+            words.extend(list(map(str, konoha_tokens)))
+
+        # determine offsets for whitespace_after field
+        index = text.index
+        current_offset = 0
+        previous_word_offset = -1
+        previous_token = None
+        for word in words:
+            try:
+                word_offset = index(word, current_offset)
+                start_position = word_offset
+            except:
+                word_offset = previous_word_offset + 1
+                start_position = (
+                    current_offset + 1 if current_offset > 0 else current_offset
+                )
+
+            token = Token(
+                text=word, start_position=start_position, whitespace_after=True
+            )
+            tokens.append(token)
+
+            if (previous_token is not None) and word_offset - 1 == previous_word_offset:
+                previous_token.whitespace_after = False
+
+            current_offset = word_offset + len(word)
+            previous_word_offset = current_offset - 1
+            previous_token = token
+
+        return tokens
+
+    return tokenizer
+
+
 def segtok_tokenizer(text: str) -> List[Token]:
     """
     Tokenizer using segtok, a third party library dedicated to rules-based Indo-European languages.
@@ -426,8 +524,11 @@ def segtok_tokenizer(text: str) -> List[Token]:
                 current_offset + 1 if current_offset > 0 else current_offset
             )
 
-        token = Token(text=word, start_position=start_position, whitespace_after=True)
-        tokens.append(token)
+        if word:
+            token = Token(
+                text=word, start_position=start_position, whitespace_after=True
+            )
+            tokens.append(token)
 
         if (previous_token is not None) and word_offset - 1 == previous_word_offset:
             previous_token.whitespace_after = False
@@ -519,11 +620,12 @@ class Sentence(DataPoint):
 
         # if text is passed, instantiate sentence with tokens (words)
         if text is not None:
+            text = self._restore_windows_1252_characters(text)
             [self.add_token(token) for token in tokenizer(text)]
 
         # log a warning if the dataset is empty
         if text == "":
-            log.warn(
+            log.warning(
                 "ACHTUNG: An empty Sentence was created! Are there empty strings in your dataset?"
             )
 
@@ -849,6 +951,17 @@ class Sentence(DataPoint):
 
         return self.language_code
 
+    @staticmethod
+    def _restore_windows_1252_characters(text: str) -> str:
+        def to_windows_1252(match):
+            try:
+                return bytes([ord(match.group(0))]).decode("windows-1252")
+            except UnicodeDecodeError:
+                # No character at the corresponding code point: remove it
+                return ""
+
+        return re.sub(r"[\u0080-\u0099]", to_windows_1252, text)
+
 
 class Image(DataPoint):
     def __init__(self, data=None, imageURL=None):
@@ -914,14 +1027,33 @@ class Corpus:
     def __init__(
         self,
         train: FlairDataset,
-        dev: FlairDataset,
-        test: FlairDataset,
+        dev: FlairDataset = None,
+        test: FlairDataset = None,
         name: str = "corpus",
     ):
-        self._train: FlairDataset = train
-        self._dev: FlairDataset = dev
-        self._test: FlairDataset = test
+        # set name
         self.name: str = name
+
+        # sample test data if none is provided
+        if test is None:
+            train_length = len(train)
+            test_size: int = round(train_length / 10)
+            splits = random_split(train, [train_length - test_size, test_size])
+            train = splits[0]
+            test = splits[1]
+
+        # sample dev data if none is provided
+        if dev is None:
+            train_length = len(train)
+            dev_size: int = round(train_length / 10)
+            splits = random_split(train, [train_length - dev_size, dev_size])
+            train = splits[0]
+            dev = splits[1]
+
+        # set train dev and test data
+        self._train: FlairDataset = train
+        self._test: FlairDataset = test
+        self._dev: FlairDataset = dev
 
     @property
     def train(self) -> FlairDataset:
@@ -1011,7 +1143,8 @@ class Corpus:
         tokens = [token for sublist in tokens for token in sublist]
         return list(map((lambda t: t.text), tokens))
 
-    def _downsample_to_proportion(self, dataset: Dataset, proportion: float):
+    @staticmethod
+    def _downsample_to_proportion(dataset: Dataset, proportion: float):
 
         sampled_size: int = round(len(dataset) * proportion)
         splits = random_split(dataset, [len(dataset) - sampled_size, sampled_size])

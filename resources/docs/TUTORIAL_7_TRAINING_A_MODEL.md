@@ -10,19 +10,18 @@ a corpus](/resources/docs/TUTORIAL_6_CORPUS.md).
 
 ## Training a Sequence Labeling Model
 
-Here is example code for a small NER model trained over WikiNER data, using simple GloVe embeddings. 
-To run this code, you first need to obtain the CoNLL-03 English dataset (alternatively, use `NLPTaskDataFetcher.load_corpus(NLPTask.WNUT_17)` instead for a task with freely available data).
-
-In this example, we downsample the data to 10% of the original data because the WikiNER dataset is huge:
+Here is example code for a small NER model trained over WNUT_17 data, using simple GloVe embeddings. 
+In this example, we downsample the data to 10% of the original data to make it run faster, but normally you 
+should train over the full dataset:
 
 ```python
 from flair.data import Corpus
-from flair.datasets import WIKINER_ENGLISH
+from flair.datasets import WNUT_17
 from flair.embeddings import TokenEmbeddings, WordEmbeddings, StackedEmbeddings
 from typing import List
 
 # 1. get the corpus
-corpus: Corpus = WIKINER_ENGLISH().downsample(0.1)
+corpus: Corpus = WNUT_17().downsample(0.1)
 print(corpus)
 
 # 2. what tag do we want to predict?
@@ -30,7 +29,7 @@ tag_type = 'ner'
 
 # 3. make the tag dictionary from the corpus
 tag_dictionary = corpus.make_tag_dictionary(tag_type=tag_type)
-print(tag_dictionary.idx2item)
+print(tag_dictionary)
 
 # 4. initialize embeddings
 embedding_types: List[TokenEmbeddings] = [
@@ -188,7 +187,7 @@ tag_type = 'upos'
 
 # 3. make the tag dictionary from the corpus
 tag_dictionary = corpus.make_tag_dictionary(tag_type=tag_type)
-print(tag_dictionary.idx2item)
+print(tag_dictionary)
 
 # 4. initialize embeddings
 embedding_types: List[TokenEmbeddings] = [
@@ -222,7 +221,6 @@ trainer.train('resources/taggers/example-universal-pos',
               )
 ```
 
-Note that here we use the MICRO_ACCURACY evaluation metric instead of the default MICRO_F1_SCORE. 
 This gives you a multilingual model. Try experimenting with more languages!
 
 
@@ -247,12 +245,9 @@ This generates PNG plots in the result folder.
 ## Resuming Training
 
 If you want to stop the training at some point and resume it at a later point, you should train with the parameter
-`checkpoint` set to `True`.
-This will save the model plus training parameters after every epoch.
-Thus, you can load the model plus trainer at any later point and continue the training exactly there where you have left.
+`checkpoint` set to `True`. This will save the model plus training parameters after every epoch. Thus, you can load the model plus trainer at any later point and continue the training exactly there where you have left.
 
-The example code below shows how to train, stop, and continue training of a `SequenceTagger`.
-Same can be done for `TextClassifier`.
+The example code below shows how to train, stop, and continue training of a `SequenceTagger`. The same can be done for `TextClassifier`.
 
 ```python
 from flair.data import Corpus
@@ -303,8 +298,8 @@ trainer.train('resources/taggers/example-ner',
 # 9. continue trainer at later point
 from pathlib import Path
 
-checkpoint = tagger.load_checkpoint(Path('resources/taggers/example-ner/checkpoint.pt'))
-trainer = ModelTrainer.load_from_checkpoint(checkpoint, corpus)
+checkpoint = 'resources/taggers/example-ner/checkpoint.pt'
+trainer = ModelTrainer.load_checkpoint(checkpoint, corpus)
 trainer.train('resources/taggers/example-ner',
               learning_rate=0.1,
               mini_batch_size=32,

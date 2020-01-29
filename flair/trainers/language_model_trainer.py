@@ -1,7 +1,6 @@
 import time, datetime
 import random
 import sys
-import logging
 from pathlib import Path
 from typing import Union
 
@@ -278,12 +277,18 @@ class LanguageModelTrainer:
 
         val_data = self._batchify(self.corpus.valid, mini_batch_size)
 
+        # error message if the validation dataset is too small
+        if val_data.size(0) == 1:
+            raise RuntimeError(
+                f"ERROR: Your validation dataset is too small. For your mini_batch_size, the data needs to "
+                f"consist of at least {mini_batch_size * 2} characters!"
+            )
+
         base_path.mkdir(parents=True, exist_ok=True)
         loss_txt = base_path / "loss.txt"
         savefile = base_path / "best-lm.pt"
 
         try:
-            epoch = self.epoch
             best_val_loss = self.loss
             optimizer = self.optimizer(
                 self.model.parameters(), lr=learning_rate, **kwargs

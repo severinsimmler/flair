@@ -5,19 +5,29 @@ from abc import abstractmethod
 from collections import Counter
 from functools import lru_cache
 from pathlib import Path
-from typing import List, Union, Dict
+from typing import List, Union, Dict, Tuple
+
+import hashlib
 
 import gensim
 import numpy as np
 import torch
-import torchvision as torchvision
 from bpemb import BPEmb
 from deprecated import deprecated
-from torch.nn import ParameterList, Parameter
 
-from pytorch_transformers import (
+import torch.nn.functional as F
+from torch.nn import ParameterList, Parameter
+from torch.nn import Sequential, Linear, Conv2d, ReLU, MaxPool2d, Dropout2d
+from torch.nn import AdaptiveAvgPool2d, AdaptiveMaxPool2d
+from torch.nn import TransformerEncoderLayer, TransformerEncoder
+
+from transformers import (
+    AlbertTokenizer,
+    AlbertModel,
     BertTokenizer,
     BertModel,
+    CamembertTokenizer,
+    CamembertModel,
     RobertaTokenizer,
     RobertaModel,
     TransfoXLTokenizer,
@@ -30,6 +40,8 @@ from pytorch_transformers import (
     XLMTokenizer,
     XLNetModel,
     XLMModel,
+    XLMRobertaTokenizer,
+    XLMRobertaModel,
     PreTrainedTokenizer,
     PreTrainedModel,
 )
@@ -42,7 +54,6 @@ from .nn import LockedDropout, WordDropout
 from .data import Dictionary, Token, Sentence, Image
 from .file_utils import cached_path, open_inside_zip
 
-import PIL
 
 log = logging.getLogger("flair")
 
@@ -455,7 +466,7 @@ class OneHotEmbeddings(TokenEmbeddings):
 
     def __init__(
         self,
-        corpus=Union[Corpus, List[Sentence]],
+        corpus: Corpus,
         field: str = "text",
         embedding_length: int = 300,
         min_freq: int = 3,
@@ -465,6 +476,7 @@ class OneHotEmbeddings(TokenEmbeddings):
         self.name = "one-hot"
         self.static_embeddings = False
         self.min_freq = min_freq
+        self.field = field
 
         tokens = list(map((lambda s: s.tokens), corpus.train))
         tokens = [token for sublist in tokens for token in sublist]
@@ -473,7 +485,7 @@ class OneHotEmbeddings(TokenEmbeddings):
             most_common = Counter(list(map((lambda t: t.text), tokens))).most_common()
         else:
             most_common = Counter(
-                list(map((lambda t: t.get_tag(field)), tokens))
+                list(map((lambda t: t.get_tag(field).value), tokens))
             ).most_common()
 
         tokens = []
@@ -498,6 +510,8 @@ class OneHotEmbeddings(TokenEmbeddings):
         )
         torch.nn.init.xavier_uniform_(self.embedding_layer.weight)
 
+        self.to(flair.device)
+
     @property
     def embedding_length(self) -> int:
         return self.__embedding_length
@@ -506,9 +520,17 @@ class OneHotEmbeddings(TokenEmbeddings):
 
         one_hot_sentences = []
         for i, sentence in enumerate(sentences):
-            context_idxs = [
-                self.vocab_dictionary.get_idx_for_item(t.text) for t in sentence.tokens
-            ]
+
+            if self.field == "text":
+                context_idxs = [
+                    self.vocab_dictionary.get_idx_for_item(t.text)
+                    for t in sentence.tokens
+                ]
+            else:
+                context_idxs = [
+                    self.vocab_dictionary.get_idx_for_item(t.get_tag(self.field).value)
+                    for t in sentence.tokens
+                ]
 
             one_hot_sentences.extend(context_idxs)
 
@@ -532,6 +554,67 @@ class OneHotEmbeddings(TokenEmbeddings):
 
     def extra_repr(self):
         return "min_freq={}".format(self.min_freq)
+
+
+class HashEmbeddings(TokenEmbeddings):
+    """Standard embeddings with Hashing Trick."""
+
+    def __init__(
+        self, num_embeddings: int = 1000, embedding_length: int = 300, hash_method="md5"
+    ):
+
+        super().__init__()
+        self.name = "hash"
+        self.static_embeddings = False
+
+        self.__num_embeddings = num_embeddings
+        self.__embedding_length = embedding_length
+
+        self.__hash_method = hash_method
+
+        # model architecture
+        self.embedding_layer = torch.nn.Embedding(
+            self.__num_embeddings, self.__embedding_length
+        )
+        torch.nn.init.xavier_uniform_(self.embedding_layer.weight)
+
+        self.to(flair.device)
+
+    @property
+    def num_embeddings(self) -> int:
+        return self.__num_embeddings
+
+    @property
+    def embedding_length(self) -> int:
+        return self.__embedding_length
+
+    def _add_embeddings_internal(self, sentences: List[Sentence]) -> List[Sentence]:
+        def get_idx_for_item(text):
+            hash_function = hashlib.new(self.__hash_method)
+            hash_function.update(bytes(str(text), "utf-8"))
+            return int(hash_function.hexdigest(), 16) % self.__num_embeddings
+
+        hash_sentences = []
+        for i, sentence in enumerate(sentences):
+            context_idxs = [get_idx_for_item(t.text) for t in sentence.tokens]
+
+            hash_sentences.extend(context_idxs)
+
+        hash_sentences = torch.tensor(hash_sentences, dtype=torch.long).to(flair.device)
+
+        embedded = self.embedding_layer.forward(hash_sentences)
+
+        index = 0
+        for sentence in sentences:
+            for token in sentence:
+                embedding = embedded[index]
+                token.set_embedding(self.name, embedding)
+                index += 1
+
+        return sentences
+
+    def __str__(self):
+        return self.name
 
 
 class MuseCrosslingualEmbeddings(TokenEmbeddings):
@@ -565,7 +648,6 @@ class MuseCrosslingualEmbeddings(TokenEmbeddings):
         for i, sentence in enumerate(sentences):
 
             language_code = sentence.get_language_code()
-            print(language_code)
             supported = [
                 "en",
                 "de",
@@ -990,37 +1072,43 @@ def _extract_embeddings(
 
 def _build_token_subwords_mapping(
     sentence: Sentence, tokenizer: PreTrainedTokenizer
-) -> Dict[int, int]:
+) -> Tuple[Dict[int, int], str]:
     """ Builds a dictionary that stores the following information:
     Token index (key) and number of corresponding subwords (value) for a sentence.
 
     :param sentence: input sentence
-    :param tokenizer: PyTorch-Transformers tokenization object
-    :return: dictionary of token index to corresponding number of subwords
+    :param tokenizer: Transformers tokenization object
+    :return: dictionary of token index to corresponding number of subwords, tokenized string
     """
     token_subwords_mapping: Dict[int, int] = {}
+
+    tokens = []
 
     for token in sentence.tokens:
         token_text = token.text
 
         subwords = tokenizer.tokenize(token_text)
 
-        token_subwords_mapping[token.idx] = len(subwords)
+        tokens.append(token.text if subwords else tokenizer.unk_token)
 
-    return token_subwords_mapping
+        token_subwords_mapping[token.idx] = len(subwords) if subwords else 1
+
+    return token_subwords_mapping, " ".join(tokens)
 
 
 def _build_token_subwords_mapping_gpt2(
     sentence: Sentence, tokenizer: PreTrainedTokenizer
-) -> Dict[int, int]:
+) -> Tuple[Dict[int, int], str]:
     """ Builds a dictionary that stores the following information:
     Token index (key) and number of corresponding subwords (value) for a sentence.
 
     :param sentence: input sentence
-    :param tokenizer: PyTorch-Transformers tokenization object
-    :return: dictionary of token index to corresponding number of subwords
+    :param tokenizer: Transformers tokenization object
+    :return: dictionary of token index to corresponding number of subwords, tokenized string
     """
     token_subwords_mapping: Dict[int, int] = {}
+
+    tokens = []
 
     for token in sentence.tokens:
         # Dummy token is needed to get the actually token tokenized correctly with special ``Ġ`` symbol
@@ -1032,9 +1120,11 @@ def _build_token_subwords_mapping_gpt2(
             token_text = "X " + token.text
             subwords = tokenizer.tokenize(token_text)[1:]
 
-        token_subwords_mapping[token.idx] = len(subwords)
+        tokens.append(token.text if subwords else tokenizer.unk_token)
 
-    return token_subwords_mapping
+        token_subwords_mapping[token.idx] = len(subwords) if subwords else 1
+
+    return token_subwords_mapping, " ".join(tokens)
 
 
 def _get_transformer_sentence_embeddings(
@@ -1065,16 +1155,22 @@ def _get_transformer_sentence_embeddings(
         for sentence in sentences:
             token_subwords_mapping: Dict[int, int] = {}
 
-            if name.startswith("gpt2") or name.startswith("roberta"):
-                token_subwords_mapping = _build_token_subwords_mapping_gpt2(
+            if ("gpt2" in name or "roberta" in name) and "xlm" not in name:
+                (
+                    token_subwords_mapping,
+                    tokenized_string,
+                ) = _build_token_subwords_mapping_gpt2(
                     sentence=sentence, tokenizer=tokenizer
                 )
             else:
-                token_subwords_mapping = _build_token_subwords_mapping(
+                (
+                    token_subwords_mapping,
+                    tokenized_string,
+                ) = _build_token_subwords_mapping(
                     sentence=sentence, tokenizer=tokenizer
                 )
 
-            subwords = tokenizer.tokenize(sentence.to_tokenized_string())
+            subwords = tokenizer.tokenize(tokenized_string)
 
             offset = 0
 
@@ -1476,6 +1572,150 @@ class RoBERTaEmbeddings(TokenEmbeddings):
         return sentences
 
 
+class CamembertEmbeddings(TokenEmbeddings):
+    def __init__(
+        self,
+        pretrained_model_name_or_path: str = "camembert-base",
+        layers: str = "-1",
+        pooling_operation: str = "first",
+        use_scalar_mix: bool = False,
+    ):
+        """CamemBERT, a Tasty French Language Model, as proposed by Martin et al. 2019.
+        :param pretrained_model_name_or_path: name or path of RoBERTa model
+        :param layers: comma-separated list of layers
+        :param pooling_operation: defines pooling operation for subwords
+        :param use_scalar_mix: defines the usage of scalar mix for specified layer(s)
+        """
+        super().__init__()
+
+        self.tokenizer = CamembertTokenizer.from_pretrained(
+            pretrained_model_name_or_path
+        )
+        self.model = CamembertModel.from_pretrained(
+            pretrained_model_name_or_path=pretrained_model_name_or_path,
+            output_hidden_states=True,
+        )
+        self.name = pretrained_model_name_or_path
+        self.layers: List[int] = [int(layer) for layer in layers.split(",")]
+        self.pooling_operation = pooling_operation
+        self.use_scalar_mix = use_scalar_mix
+        self.static_embeddings = True
+
+        dummy_sentence: Sentence = Sentence()
+        dummy_sentence.add_token(Token("hello"))
+        embedded_dummy = self.embed(dummy_sentence)
+        self.__embedding_length: int = len(
+            embedded_dummy[0].get_token(1).get_embedding()
+        )
+
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        state["tokenizer"] = None
+        return state
+
+    def __setstate__(self, d):
+        self.__dict__ = d
+
+        # 1-camembert-base -> camembert-base
+        self.tokenizer = self.tokenizer = CamembertTokenizer.from_pretrained(
+            "-".join(self.name.split("-")[1:])
+        )
+
+    @property
+    def embedding_length(self) -> int:
+        return self.__embedding_length
+
+    def _add_embeddings_internal(self, sentences: List[Sentence]) -> List[Sentence]:
+        self.model.to(flair.device)
+        self.model.eval()
+
+        sentences = _get_transformer_sentence_embeddings(
+            sentences=sentences,
+            tokenizer=self.tokenizer,
+            model=self.model,
+            name=self.name,
+            layers=self.layers,
+            pooling_operation=self.pooling_operation,
+            use_scalar_mix=self.use_scalar_mix,
+            bos_token="<s>",
+            eos_token="</s>",
+        )
+
+        return sentences
+
+
+class XLMRobertaEmbeddings(TokenEmbeddings):
+    def __init__(
+        self,
+        pretrained_model_name_or_path: str = "xlm-roberta-large",
+        layers: str = "-1",
+        pooling_operation: str = "first",
+        use_scalar_mix: bool = False,
+    ):
+        """XLM-RoBERTa as proposed by Conneau et al. 2019.
+        :param pretrained_model_name_or_path: name or path of XLM-R model
+        :param layers: comma-separated list of layers
+        :param pooling_operation: defines pooling operation for subwords
+        :param use_scalar_mix: defines the usage of scalar mix for specified layer(s)
+        """
+        super().__init__()
+
+        self.tokenizer = XLMRobertaTokenizer.from_pretrained(
+            pretrained_model_name_or_path
+        )
+        self.model = XLMRobertaModel.from_pretrained(
+            pretrained_model_name_or_path=pretrained_model_name_or_path,
+            output_hidden_states=True,
+        )
+        self.name = pretrained_model_name_or_path
+        self.layers: List[int] = [int(layer) for layer in layers.split(",")]
+        self.pooling_operation = pooling_operation
+        self.use_scalar_mix = use_scalar_mix
+        self.static_embeddings = True
+
+        dummy_sentence: Sentence = Sentence()
+        dummy_sentence.add_token(Token("hello"))
+        embedded_dummy = self.embed(dummy_sentence)
+        self.__embedding_length: int = len(
+            embedded_dummy[0].get_token(1).get_embedding()
+        )
+
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        state["tokenizer"] = None
+        return state
+
+    def __setstate__(self, d):
+        self.__dict__ = d
+
+        # 1-xlm-roberta-large -> xlm-roberta-large
+        self.tokenizer = self.tokenizer = XLMRobertaTokenizer.from_pretrained(
+            "-".join(self.name.split("-")[1:])
+        )
+
+    @property
+    def embedding_length(self) -> int:
+        return self.__embedding_length
+
+    def _add_embeddings_internal(self, sentences: List[Sentence]) -> List[Sentence]:
+        self.model.to(flair.device)
+        self.model.eval()
+
+        sentences = _get_transformer_sentence_embeddings(
+            sentences=sentences,
+            tokenizer=self.tokenizer,
+            model=self.model,
+            name=self.name,
+            layers=self.layers,
+            pooling_operation=self.pooling_operation,
+            use_scalar_mix=self.use_scalar_mix,
+            bos_token="<s>",
+            eos_token="</s>",
+        )
+
+        return sentences
+
+
 class CharacterEmbeddings(TokenEmbeddings):
     """Character embeddings of words, as proposed in Lample et al., 2016."""
 
@@ -1608,10 +1848,12 @@ class FlairEmbeddings(TokenEmbeddings):
 
         self.PRETRAINED_MODEL_ARCHIVE_MAP = {
             # multilingual models
-            "multi-forward": f"{aws_path}/embeddings-v0.4/lm-multi-forward-v0.1.pt",
-            "multi-backward": f"{aws_path}/embeddings-v0.4/lm-multi-backward-v0.1.pt",
-            "multi-forward-fast": f"{aws_path}/embeddings-v0.4/lm-multi-forward-fast-v0.1.pt",
-            "multi-backward-fast": f"{aws_path}/embeddings-v0.4/lm-multi-backward-fast-v0.1.pt",
+            "multi-forward": f"{aws_path}/embeddings-v0.4.3/lm-jw300-forward-v0.1.pt",
+            "multi-backward": f"{aws_path}/embeddings-v0.4.3/lm-jw300-backward-v0.1.pt",
+            "multi-v0-forward": f"{aws_path}/embeddings-v0.4/lm-multi-forward-v0.1.pt",
+            "multi-v0-backward": f"{aws_path}/embeddings-v0.4/lm-multi-backward-v0.1.pt",
+            "multi-v0-forward-fast": f"{aws_path}/embeddings-v0.4/lm-multi-forward-fast-v0.1.pt",
+            "multi-v0-backward-fast": f"{aws_path}/embeddings-v0.4/lm-multi-backward-fast-v0.1.pt",
             # English models
             "en-forward": f"{aws_path}/embeddings-v0.4.1/big-news-forward--h2048-l1-d0.05-lr30-0.25-20/news-forward-0.4.1.pt",
             "en-backward": f"{aws_path}/embeddings-v0.4.1/big-news-backward--h2048-l1-d0.05-lr30-0.25-20/news-backward-0.4.1.pt",
@@ -1901,22 +2143,23 @@ class PooledFlairEmbeddings(TokenEmbeddings):
             for token in sentence.tokens:
 
                 # update embedding
-                local_embedding = token._embeddings[self.context_embeddings.name]
-                local_embedding = local_embedding.to(flair.device)
+                local_embedding = token._embeddings[self.context_embeddings.name].cpu()
 
-                if token.text[0].isupper() or not self.only_capitalized:
+                # check token.text is empty or not
+                if token.text:
+                    if token.text[0].isupper() or not self.only_capitalized:
 
-                    if token.text not in self.word_embeddings:
-                        self.word_embeddings[token.text] = local_embedding
-                        self.word_count[token.text] = 1
-                    else:
-                        aggregated_embedding = self.aggregate_op(
-                            self.word_embeddings[token.text], local_embedding
-                        )
-                        if self.pooling == "fade":
-                            aggregated_embedding /= 2
-                        self.word_embeddings[token.text] = aggregated_embedding
-                        self.word_count[token.text] += 1
+                        if token.text not in self.word_embeddings:
+                            self.word_embeddings[token.text] = local_embedding
+                            self.word_count[token.text] = 1
+                        else:
+                            aggregated_embedding = self.aggregate_op(
+                                self.word_embeddings[token.text], local_embedding
+                            )
+                            if self.pooling == "fade":
+                                aggregated_embedding /= 2
+                            self.word_embeddings[token.text] = aggregated_embedding
+                            self.word_count[token.text] += 1
 
         # add embeddings after updating
         for sentence in sentences:
@@ -1956,19 +2199,25 @@ class BertEmbeddings(TokenEmbeddings):
         """
         super().__init__()
 
-        if bert_model_or_path.startswith("distilbert"):
+        if "distilbert" in bert_model_or_path:
             try:
-                from pytorch_transformers import DistilBertTokenizer, DistilBertModel
+                from transformers import DistilBertTokenizer, DistilBertModel
             except ImportError:
                 log.warning("-" * 100)
                 log.warning(
-                    "ATTENTION! To use DistilBert, please first install a recent version of pytorch-transformers!"
+                    "ATTENTION! To use DistilBert, please first install a recent version of transformers!"
                 )
                 log.warning("-" * 100)
                 pass
 
             self.tokenizer = DistilBertTokenizer.from_pretrained(bert_model_or_path)
             self.model = DistilBertModel.from_pretrained(
+                pretrained_model_name_or_path=bert_model_or_path,
+                output_hidden_states=True,
+            )
+        elif "albert" in bert_model_or_path:
+            self.tokenizer = AlbertTokenizer.from_pretrained(bert_model_or_path)
+            self.model = AlbertModel.from_pretrained(
                 pretrained_model_name_or_path=bert_model_or_path,
                 output_hidden_states=True,
             )
@@ -2106,11 +2355,9 @@ class BertEmbeddings(TokenEmbeddings):
                                 sentence_index
                             ]
                         else:
-                            layer_output = (
-                                all_encoder_layers[int(layer_index)]
-                                .detach()
-                                .cpu()[sentence_index]
-                            )
+                            layer_output = all_encoder_layers[int(layer_index)][
+                                sentence_index
+                            ]
                         all_layers.append(layer_output[token_index])
 
                     if self.use_scalar_mix:
@@ -2646,14 +2893,11 @@ class DocumentRNNEmbeddings(DocumentEmbeddings):
         self.name = "document_" + self.rnn._get_name()
 
         # dropouts
-        if locked_dropout > 0.0:
-            self.dropout: torch.nn.Module = LockedDropout(locked_dropout)
-        else:
-            self.dropout = torch.nn.Dropout(dropout)
-
-        self.use_word_dropout: bool = word_dropout > 0.0
-        if self.use_word_dropout:
-            self.word_dropout = WordDropout(word_dropout)
+        self.dropout = torch.nn.Dropout(dropout) if dropout > 0.0 else None
+        self.locked_dropout = (
+            LockedDropout(locked_dropout) if locked_dropout > 0.0 else None
+        )
+        self.word_dropout = WordDropout(word_dropout) if word_dropout > 0.0 else None
 
         torch.nn.init.xavier_uniform_(self.word_reprojection_map.weight)
 
@@ -2669,6 +2913,12 @@ class DocumentRNNEmbeddings(DocumentEmbeddings):
         """Add embeddings to all sentences in the given list of sentences. If embeddings are already added, update
          only if embeddings are non-static."""
 
+        # TODO: remove in future versions
+        if not hasattr(self, "locked_dropout"):
+            self.locked_dropout = None
+        if not hasattr(self, "word_dropout"):
+            self.word_dropout = None
+
         if type(sentences) is Sentence:
             sentences = [sentences]
 
@@ -2680,56 +2930,59 @@ class DocumentRNNEmbeddings(DocumentEmbeddings):
         lengths: List[int] = [len(sentence.tokens) for sentence in sentences]
         longest_token_sequence_in_batch: int = max(lengths)
 
-        # initialize zero-padded word embeddings tensor
-        sentence_tensor = torch.zeros(
-            [
-                len(sentences),
-                longest_token_sequence_in_batch,
-                self.embeddings.embedding_length,
-            ],
+        pre_allocated_zero_tensor = torch.zeros(
+            self.embeddings.embedding_length * longest_token_sequence_in_batch,
             dtype=torch.float,
             device=flair.device,
         )
 
-        for s_id, sentence in enumerate(sentences):
-            # fill values with word embeddings
-            all_embs = list()
+        all_embs: List[torch.Tensor] = list()
+        for sentence in sentences:
+            all_embs += [
+                emb for token in sentence for emb in token.get_each_embedding()
+            ]
+            nb_padding_tokens = longest_token_sequence_in_batch - len(sentence)
 
-            for index_token, token in enumerate(sentence):
-                embs = token.get_each_embedding()
-                if not all_embs:
-                    all_embs = [list() for _ in range(len(embs))]
-                for index_emb, emb in enumerate(embs):
-                    all_embs[index_emb].append(emb)
+            if nb_padding_tokens > 0:
+                t = pre_allocated_zero_tensor[
+                    : self.embeddings.embedding_length * nb_padding_tokens
+                ]
+                all_embs.append(t)
 
-            concat_word_emb = [torch.stack(embs) for embs in all_embs]
-            concat_sentence_emb = torch.cat(concat_word_emb, dim=1)
-            sentence_tensor[s_id][: len(sentence)] = concat_sentence_emb
+        sentence_tensor = torch.cat(all_embs).view(
+            [
+                len(sentences),
+                longest_token_sequence_in_batch,
+                self.embeddings.embedding_length,
+            ]
+        )
 
-        # --------------------------------------------------------------------
-        # FF PART
-        # --------------------------------------------------------------------
-        sentence_tensor = self.dropout(sentence_tensor)
-        # use word dropout if set
-        if self.use_word_dropout:
+        # before-RNN dropout
+        if self.dropout:
+            sentence_tensor = self.dropout(sentence_tensor)
+        if self.locked_dropout:
+            sentence_tensor = self.locked_dropout(sentence_tensor)
+        if self.word_dropout:
             sentence_tensor = self.word_dropout(sentence_tensor)
 
+        # reproject if set
         if self.reproject_words:
             sentence_tensor = self.word_reprojection_map(sentence_tensor)
 
+        # push through RNN
         packed = pack_padded_sequence(
             sentence_tensor, lengths, enforce_sorted=False, batch_first=True
         )
-
         rnn_out, hidden = self.rnn(packed)
-
         outputs, output_lengths = pad_packed_sequence(rnn_out, batch_first=True)
 
-        outputs = self.dropout(outputs)
+        # after-RNN dropout
+        if self.dropout:
+            outputs = self.dropout(outputs)
+        if self.locked_dropout:
+            outputs = self.locked_dropout(outputs)
 
-        # --------------------------------------------------------------------
-        # EXTRACT EMBEDDINGS FROM RNN
-        # --------------------------------------------------------------------
+        # extract embeddings from RNN
         for sentence_no, length in enumerate(lengths):
             last_rep = outputs[sentence_no, length - 1]
 
@@ -2743,6 +2996,40 @@ class DocumentRNNEmbeddings(DocumentEmbeddings):
 
             sentence = sentences[sentence_no]
             sentence.set_embedding(self.name, embedding)
+
+    def _apply(self, fn):
+        major, minor, build, *_ = (int(info)
+                                for info in torch.__version__.replace("+cpu","").split('.'))
+
+        # fixed RNN change format for torch 1.4.0
+        if major >= 1 and minor >= 4:
+            for child_module in self.children():
+                if isinstance(child_module, torch.nn.RNNBase):
+                    _flat_weights_names = []
+                    num_direction = None
+
+                    if child_module.__dict__["bidirectional"]:
+                        num_direction = 2
+                    else:
+                        num_direction = 1
+                    for layer in range(child_module.__dict__["num_layers"]):
+                        for direction in range(num_direction):
+                            suffix = "_reverse" if direction == 1 else ""
+                            param_names = ["weight_ih_l{}{}", "weight_hh_l{}{}"]
+                            if child_module.__dict__["bias"]:
+                                param_names += ["bias_ih_l{}{}", "bias_hh_l{}{}"]
+                            param_names = [
+                                x.format(layer, suffix) for x in param_names
+                            ]
+                            _flat_weights_names.extend(param_names)
+
+                    setattr(child_module, "_flat_weights_names",
+                            _flat_weights_names)
+
+                child_module._apply(fn)
+
+        else:
+            super()._apply(fn)
 
 
 @deprecated(
@@ -3016,6 +3303,9 @@ class NILCEmbeddings(WordEmbeddings):
 
 class IdentityImageEmbeddings(ImageEmbeddings):
     def __init__(self, transforms):
+        import PIL as pythonimagelib
+
+        self.PIL = pythonimagelib
         self.name = "Identity"
         self.transforms = transforms
         self.__embedding_length = None
@@ -3024,7 +3314,7 @@ class IdentityImageEmbeddings(ImageEmbeddings):
 
     def _add_embeddings_internal(self, images: List[Image]) -> List[Image]:
         for image in images:
-            image_data = PIL.Image.open(image.imageURL)
+            image_data = self.PIL.Image.open(image.imageURL)
             image_data.load()
             image.set_embedding(self.name, self.transforms(image_data))
 
@@ -3064,6 +3354,18 @@ class PrecomputedImageEmbeddings(ImageEmbeddings):
 class NetworkImageEmbeddings(ImageEmbeddings):
     def __init__(self, name, pretrained=True, transforms=None):
         super().__init__()
+
+        try:
+            import torchvision as torchvision
+        except ModuleNotFoundError:
+            log.warning("-" * 100)
+            log.warning('ATTENTION! The library "torchvision" is not installed!')
+            log.warning(
+                'To use convnets pretraned on ImageNet, please first install with "pip install torchvision"'
+            )
+            log.warning("-" * 100)
+            pass
+
         model_info = {
             "resnet50": (torchvision.models.resnet50, lambda x: list(x)[:-1], 2048),
             "mobilenet_v2": (
@@ -3121,6 +3423,151 @@ class NetworkImageEmbeddings(ImageEmbeddings):
         return self.name
 
 
+class ConvTransformNetworkImageEmbeddings(ImageEmbeddings):
+    def __init__(self, feats_in, convnet_parms, posnet_parms, transformer_parms):
+        super(ConvTransformNetworkImageEmbeddings, self).__init__()
+
+        adaptive_pool_func_map = {"max": AdaptiveMaxPool2d, "avg": AdaptiveAvgPool2d}
+
+        convnet_arch = (
+            []
+            if convnet_parms["dropout"][0] <= 0
+            else [Dropout2d(convnet_parms["dropout"][0])]
+        )
+        convnet_arch.extend(
+            [
+                Conv2d(
+                    in_channels=feats_in,
+                    out_channels=convnet_parms["n_feats_out"][0],
+                    kernel_size=convnet_parms["kernel_sizes"][0],
+                    padding=convnet_parms["kernel_sizes"][0][0] // 2,
+                    stride=convnet_parms["strides"][0],
+                    groups=convnet_parms["groups"][0],
+                ),
+                ReLU(),
+            ]
+        )
+        if "0" in convnet_parms["pool_layers_map"]:
+            convnet_arch.append(
+                MaxPool2d(kernel_size=convnet_parms["pool_layers_map"]["0"])
+            )
+        for layer_id, (kernel_size, n_in, n_out, groups, stride, dropout) in enumerate(
+            zip(
+                convnet_parms["kernel_sizes"][1:],
+                convnet_parms["n_feats_out"][:-1],
+                convnet_parms["n_feats_out"][1:],
+                convnet_parms["groups"][1:],
+                convnet_parms["strides"][1:],
+                convnet_parms["dropout"][1:],
+            )
+        ):
+            if dropout > 0:
+                convnet_arch.append(Dropout2d(dropout))
+            convnet_arch.append(
+                Conv2d(
+                    in_channels=n_in,
+                    out_channels=n_out,
+                    kernel_size=kernel_size,
+                    padding=kernel_size[0] // 2,
+                    stride=stride,
+                    groups=groups,
+                )
+            )
+            convnet_arch.append(ReLU())
+            if str(layer_id + 1) in convnet_parms["pool_layers_map"]:
+                convnet_arch.append(
+                    MaxPool2d(
+                        kernel_size=convnet_parms["pool_layers_map"][str(layer_id + 1)]
+                    )
+                )
+        convnet_arch.append(
+            adaptive_pool_func_map[convnet_parms["adaptive_pool_func"]](
+                output_size=convnet_parms["output_size"]
+            )
+        )
+        self.conv_features = Sequential(*convnet_arch)
+        conv_feat_dim = convnet_parms["n_feats_out"][-1]
+        if posnet_parms is not None and transformer_parms is not None:
+            self.use_transformer = True
+            if posnet_parms["nonlinear"]:
+                posnet_arch = [
+                    Linear(2, posnet_parms["n_hidden"]),
+                    ReLU(),
+                    Linear(posnet_parms["n_hidden"], conv_feat_dim),
+                ]
+            else:
+                posnet_arch = [Linear(2, conv_feat_dim)]
+            self.position_features = Sequential(*posnet_arch)
+            transformer_layer = TransformerEncoderLayer(
+                d_model=conv_feat_dim, **transformer_parms["transformer_encoder_parms"]
+            )
+            self.transformer = TransformerEncoder(
+                transformer_layer, num_layers=transformer_parms["n_blocks"]
+            )
+            # <cls> token initially set to 1/D, so it attends to all image features equally
+            self.cls_token = Parameter(torch.ones(conv_feat_dim, 1) / conv_feat_dim)
+            self._feat_dim = conv_feat_dim
+        else:
+            self.use_transformer = False
+            self._feat_dim = (
+                convnet_parms["output_size"][0]
+                * convnet_parms["output_size"][1]
+                * conv_feat_dim
+            )
+
+    def forward(self, x):
+        x = self.conv_features(x)  # [b, d, h, w]
+        b, d, h, w = x.shape
+        if self.use_transformer:
+            # add positional encodings
+            y = torch.stack(
+                [
+                    torch.cat([torch.arange(h).unsqueeze(1)] * w, dim=1),
+                    torch.cat([torch.arange(w).unsqueeze(0)] * h, dim=0),
+                ]
+            )  # [2, h, w
+            y = y.view([2, h * w]).transpose(1, 0)  # [h*w, 2]
+            y = y.type(torch.float32).to(flair.device)
+            y = (
+                self.position_features(y).transpose(1, 0).view([d, h, w])
+            )  # [h*w, d] => [d, h, w]
+            y = y.unsqueeze(dim=0)  # [1, d, h, w]
+            x = x + y  # [b, d, h, w] + [1, d, h, w] => [b, d, h, w]
+            # reshape the pixels into the sequence
+            x = x.view([b, d, h * w])  # [b, d, h*w]
+            # layer norm after convolution and positional encodings
+            x = F.layer_norm(x.permute([0, 2, 1]), (d,)).permute([0, 2, 1])
+            # add <cls> token
+            x = torch.cat(
+                [x, torch.stack([self.cls_token] * b)], dim=2
+            )  # [b, d, h*w+1]
+            # transformer requires input in the shape [h*w+1, b, d]
+            x = (
+                x.view([b * d, h * w + 1]).transpose(1, 0).view([h * w + 1, b, d])
+            )  # [b, d, h*w+1] => [b*d, h*w+1] => [h*w+1, b*d] => [h*w+1, b*d]
+            x = self.transformer(x)  # [h*w+1, b, d]
+            # the output is an embedding of <cls> token
+            x = x[-1, :, :]  # [b, d]
+        else:
+            x = x.view([-1, self._feat_dim])
+            x = F.layer_norm(x, (self._feat_dim,))
+
+        return x
+
+    def _add_embeddings_internal(self, images: List[Image]) -> List[Image]:
+        image_tensor = torch.stack([image.data for image in images])
+        image_embeddings = self.forward(image_tensor)
+        for image_id, image in enumerate(images):
+            image.set_embedding(self.name, image_embeddings[image_id])
+
+    @property
+    def embedding_length(self):
+        return self._feat_dim
+
+    def __str__(self):
+        return self.name
+
+
 def replace_with_language_code(string: str):
     string = string.replace("arabic-", "ar-")
     string = string.replace("basque-", "eu-")
@@ -3146,3 +3593,35 @@ def replace_with_language_code(string: str):
     string = string.replace("spanish-", "es-")
     string = string.replace("swedish-", "sv-")
     return string
+
+
+# TODO: keep for backwards compatibility, but remove in future
+class BPEmbSerializable(BPEmb):
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        # save the sentence piece model as binary file (not as path which may change)
+        state["spm_model_binary"] = open(self.model_file, mode="rb").read()
+        state["spm"] = None
+        return state
+
+    def __setstate__(self, state):
+        from bpemb.util import sentencepiece_load
+
+        model_file = self.model_tpl.format(lang=state["lang"], vs=state["vs"])
+        self.__dict__ = state
+
+        # write out the binary sentence piece model into the expected directory
+        self.cache_dir: Path = Path(flair.cache_root) / "embeddings"
+        if "spm_model_binary" in self.__dict__:
+            # if the model was saved as binary and it is not found on disk, write to appropriate path
+            if not os.path.exists(self.cache_dir / state["lang"]):
+                os.makedirs(self.cache_dir / state["lang"])
+            self.model_file = self.cache_dir / model_file
+            with open(self.model_file, "wb") as out:
+                out.write(self.__dict__["spm_model_binary"])
+        else:
+            # otherwise, use normal process and potentially trigger another download
+            self.model_file = self._load_file(model_file)
+
+        # once the modes if there, load it with sentence piece
+        state["spm"] = sentencepiece_load(self.model_file)

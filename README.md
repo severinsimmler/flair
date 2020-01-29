@@ -1,4 +1,4 @@
-![alt text](resources/docs/flair_logo.svg)
+![alt text](resources/docs/flair_logo_2020.png)
 
 [![PyPI version](https://badge.fury.io/py/flair.svg)](https://badge.fury.io/py/flair)
 [![GitHub Issues](https://img.shields.io/github/issues/zalandoresearch/flair.svg)](https://github.com/zalandoresearch/flair/issues)
@@ -25,7 +25,7 @@ document embeddings, including our proposed **[Flair embeddings](https://drive.g
 * **A PyTorch NLP framework.** Our framework builds directly on [PyTorch](https://pytorch.org/), making it easy to 
 train your own models and experiment with new approaches using Flair embeddings and classes.
 
-Now at [version 0.4.3](https://github.com/zalandoresearch/flair/releases)!
+Now at [version 0.4.5](https://github.com/zalandoresearch/flair/releases)!
 
 ## Comparison with State-of-the-Art
 
@@ -45,7 +45,7 @@ Flair outperforms the previous best methods on a range of NLP tasks:
 
 Here's how to [reproduce these numbers](/resources/docs/EXPERIMENTS.md) using Flair. You can also find detailed evaluations and discussions in our papers:
 
-* *[Contextual String Embeddings for Sequence Labeling](https://aclanthology.coli.uni-saarland.de/papers/C18-1139/c18-1139).
+* *[Contextual String Embeddings for Sequence Labeling](https://www.aclweb.org/anthology/C18-1139/).
 Alan Akbik, Duncan Blythe and Roland Vollgraf. 
 27th International Conference on Computational Linguistics, **COLING 2018**.*
 
@@ -133,7 +133,8 @@ There are also good third-party articles and posts that illustrate how to use Fl
 * [A docker image for Flair](https://towardsdatascience.com/docker-image-for-nlp-5402c9a9069e)
 * [Great overview of Flair functionality and how to use in Colab](https://www.analyticsvidhya.com/blog/2019/02/flair-nlp-library-python/)
 * [Visualisation tool for highlighting the extracted entities](https://github.com/lunayach/visNER)
-
+* [Practical approach of State-of-the-Art Flair in Named Entity Recognition](https://medium.com/analytics-vidhya/practical-approach-of-state-of-the-art-flair-in-named-entity-recognition-46a837e25e6b)
+* [Benchmarking NER algorithms](https://towardsdatascience.com/benchmark-ner-algorithm-d4ab01b2d4c3)
 
 ## Citing Flair
 

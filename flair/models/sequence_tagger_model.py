@@ -1,9 +1,6 @@
 import logging
 from pathlib import Path
-
-import logging
-from pathlib import Path
-from typing import List, Union, Optional
+from typing import List, Union, Optional, Callable, Dict
 
 import numpy as np
 import torch
@@ -11,11 +8,12 @@ import torch.nn
 import torch.nn.functional as F
 from tabulate import tabulate
 from torch.nn.parameter import Parameter
+from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 import flair.nn
-from flair.data import Dictionary, Sentence, Token, Label
-from flair.datasets import DataLoader
+from flair.data import Dictionary, Sentence, Token, Label, space_tokenizer
+from flair.datasets import SentenceDataset, StringDataset
 from flair.embeddings import TokenEmbeddings
 from flair.file_utils import cached_path
 from flair.training_utils import Metric, Result, store_embeddings
@@ -80,6 +78,8 @@ class SequenceTagger(flair.nn.Model):
         train_initial_hidden_state: bool = False,
         rnn_type: str = "LSTM",
         pickle_module: str = "pickle",
+        beta: float = 1.0,
+        loss_weights: Dict[str, float] = None,
     ):
         """
         Initializes a SequenceTagger
@@ -94,10 +94,13 @@ class SequenceTagger(flair.nn.Model):
         :param word_dropout: word dropout probability
         :param locked_dropout: locked dropout probability
         :param train_initial_hidden_state: if True, trains initial hidden state of RNN
+        :param beta: Parameter for F-beta score for evaluation and training annealing
+        :param loss_weights: Dictionary of weights for classes (tags) for the loss function
+        (if any tag's weight is unspecified it will default to 1.0)
+
         """
 
         super(SequenceTagger, self).__init__()
-
         self.use_rnn = use_rnn
         self.hidden_size = hidden_size
         self.use_crf: bool = use_crf
@@ -111,6 +114,20 @@ class SequenceTagger(flair.nn.Model):
         self.tag_dictionary: Dictionary = tag_dictionary
         self.tag_type: str = tag_type
         self.tagset_size: int = len(tag_dictionary)
+
+        self.beta = beta
+
+        self.weight_dict = loss_weights
+        # Initialize the weight tensor
+        if loss_weights is not None:
+            n_classes = len(self.tag_dictionary)
+            weight_list = [1. for i in range(n_classes)]
+            for i, tag in enumerate(self.tag_dictionary.get_items()):
+                if tag in loss_weights.keys():
+                    weight_list[i] = loss_weights[tag]
+            self.loss_weights = torch.FloatTensor(weight_list).to(flair.device)
+        else:
+            self.loss_weights = None
 
         # initialize the network architecture
         self.nlayers: int = rnn_layers
@@ -213,26 +230,31 @@ class SequenceTagger(flair.nn.Model):
             "use_word_dropout": self.use_word_dropout,
             "use_locked_dropout": self.use_locked_dropout,
             "rnn_type": self.rnn_type,
+            "beta": self.beta,
+            "weight_dict": self.weight_dict,
         }
         return model_state
 
+    @staticmethod
     def _init_model_with_state_dict(state):
 
-        rnn_type = "LSTM" if not "rnn_type" in state.keys() else state["rnn_type"]
-        use_dropout = 0.0 if not "use_dropout" in state.keys() else state["use_dropout"]
+        rnn_type = "LSTM" if "rnn_type" not in state.keys() else state["rnn_type"]
+        use_dropout = 0.0 if "use_dropout" not in state.keys() else state["use_dropout"]
         use_word_dropout = (
-            0.0 if not "use_word_dropout" in state.keys() else state["use_word_dropout"]
+            0.0 if "use_word_dropout" not in state.keys() else state["use_word_dropout"]
         )
         use_locked_dropout = (
             0.0
-            if not "use_locked_dropout" in state.keys()
+            if "use_locked_dropout" not in state.keys()
             else state["use_locked_dropout"]
         )
         train_initial_hidden_state = (
             False
-            if not "train_initial_hidden_state" in state.keys()
+            if "train_initial_hidden_state" not in state.keys()
             else state["train_initial_hidden_state"]
         )
+        beta = 1.0 if "beta" not in state.keys() else state["beta"]
+        weights = None if "weight_dict" not in state.keys() else state["weight_dict"]
 
         model = SequenceTagger(
             hidden_size=state["hidden_size"],
@@ -247,9 +269,117 @@ class SequenceTagger(flair.nn.Model):
             locked_dropout=use_locked_dropout,
             train_initial_hidden_state=train_initial_hidden_state,
             rnn_type=rnn_type,
+            beta=beta,
+            loss_weights=weights,
         )
         model.load_state_dict(state["state_dict"])
         return model
+
+    def predict(
+        self,
+        sentences: Union[List[Sentence], Sentence, List[str], str],
+        mini_batch_size=32,
+        embedding_storage_mode="none",
+        all_tag_prob: bool = False,
+        verbose: bool = False,
+        use_tokenizer: Union[bool, Callable[[str], List[Token]]] = space_tokenizer,
+    ) -> List[Sentence]:
+        """
+        Predict sequence tags for Named Entity Recognition task
+        :param sentences: a Sentence or a string or a List of Sentence or a List of string.
+        :param mini_batch_size: size of the minibatch, usually bigger is more rapid but consume more memory,
+        up to a point when it has no more effect.
+        :param embedding_storage_mode: 'none' for the minimum memory footprint, 'cpu' to store embeddings in Ram,
+        'gpu' to store embeddings in GPU memory.
+        :param all_tag_prob: True to compute the score for each tag on each token,
+        otherwise only the score of the best tag is returned
+        :param verbose: set to True to display a progress bar
+        :param use_tokenizer: a custom tokenizer when string are provided (default is space based tokenizer).
+        :return: List of Sentence enriched by the predicted tags
+        """
+        with torch.no_grad():
+            if not sentences:
+                return sentences
+
+            if isinstance(sentences, Sentence) or isinstance(sentences, str):
+                sentences = [sentences]
+
+            if (flair.device.type == "cuda") and embedding_storage_mode == "cpu":
+                log.warning(
+                    "You are inferring on GPU with parameter 'embedding_storage_mode' set to 'cpu'."
+                    "This option will slow down your inference, usually 'none' (default value) "
+                    "is a better choice."
+                )
+
+            # reverse sort all sequences by their length
+            rev_order_len_index = sorted(
+                range(len(sentences)), key=lambda k: len(sentences[k]), reverse=True
+            )
+            original_order_index = sorted(
+                range(len(rev_order_len_index)), key=lambda k: rev_order_len_index[k]
+            )
+
+            reordered_sentences: List[Union[Sentence, str]] = [
+                sentences[index] for index in rev_order_len_index
+            ]
+
+            if isinstance(sentences[0], Sentence):
+                # remove previous embeddings
+                store_embeddings(reordered_sentences, "none")
+                dataset = SentenceDataset(reordered_sentences)
+            else:
+                dataset = StringDataset(
+                    reordered_sentences, use_tokenizer=use_tokenizer
+                )
+            dataloader = DataLoader(
+                dataset=dataset, batch_size=mini_batch_size, collate_fn=lambda x: x
+            )
+
+            if self.use_crf:
+                transitions = self.transitions.detach().cpu().numpy()
+            else:
+                transitions = None
+
+            # progress bar for verbosity
+            if verbose:
+                dataloader = tqdm(dataloader)
+
+            results: List[Sentence] = []
+            for i, batch in enumerate(dataloader):
+
+                if verbose:
+                    dataloader.set_description(f"Inferencing on batch {i}")
+                results += batch
+                batch = self._filter_empty_sentences(batch)
+                # stop if all sentences are empty
+                if not batch:
+                    continue
+
+                feature: torch.Tensor = self.forward(batch)
+                tags, all_tags = self._obtain_labels(
+                    feature=feature,
+                    batch_sentences=batch,
+                    transitions=transitions,
+                    get_all_tags=all_tag_prob,
+                )
+
+                for (sentence, sent_tags) in zip(batch, tags):
+                    for (token, tag) in zip(sentence.tokens, sent_tags):
+                        token.add_tag_label(self.tag_type, tag)
+
+                # all_tags will be empty if all_tag_prob is set to False, so the for loop will be avoided
+                for (sentence, sent_all_tags) in zip(batch, all_tags):
+                    for (token, token_all_tags) in zip(sentence.tokens, sent_all_tags):
+                        token.add_tags_proba_dist(self.tag_type, token_all_tags)
+
+                # clearing token embeddings to save memory
+                store_embeddings(batch, storage_mode=embedding_storage_mode)
+
+            results: List[Union[Sentence, str]] = [
+                results[index] for index in original_order_index
+            ]
+            assert len(sentences) == len(results)
+            return results
 
     def evaluate(
         self,
@@ -266,7 +396,7 @@ class SequenceTagger(flair.nn.Model):
 
             batch_no: int = 0
 
-            metric = Metric("Evaluation")
+            metric = Metric("Evaluation", beta=self.beta)
 
             lines: List[str] = []
 
@@ -363,89 +493,7 @@ class SequenceTagger(flair.nn.Model):
         features = self.forward(data_points)
         return self._calculate_loss(features, data_points)
 
-    def predict(
-        self,
-        sentences: Union[List[Sentence], Sentence],
-        mini_batch_size=32,
-        embedding_storage_mode="none",
-        all_tag_prob: bool = False,
-        verbose=False,
-    ) -> List[Sentence]:
-        """
-        Predict sequence tags for Named Entity Recognition task
-        :param sentences: a Sentence or a List of Sentence. Empty sentences will be removed.
-        :param mini_batch_size: size of the minibatch, usually bigger is more rapid but consume more memory,
-        up to a point when it has no more effect.
-        :param embedding_storage_mode: 'none' for the minimum memory footprint, 'cpu' to store embeddings in Ram,
-        'gpu' to store embeddings in GPU memory.
-        :param all_tag_prob: True to compute the score for each tag on each token,
-        otherwise only the score of the best tag is returned
-        :param verbose: set to True to display a progress bar
-        :return: List of Sentence enriched by the predicted tags
-        """
-        with torch.no_grad():
-            if isinstance(sentences, Sentence):
-                sentences = [sentences]
-
-            if (flair.device.type == "cuda") and embedding_storage_mode == "cpu":
-                log.warning(
-                    "You are inferring on GPU with parameter 'embedding_storage_mode' set to 'cpu'."
-                    "This option will slow down your inference, usually 'none' (default value) "
-                    "is a better choice."
-                )
-
-            filtered_sentences = self._filter_empty_sentences(sentences)
-
-            # remove previous embeddings
-            store_embeddings(filtered_sentences, "none")
-
-            # reverse sort all sequences by their length
-            filtered_sentences.sort(key=lambda x: len(x), reverse=True)
-
-            if self.use_crf:
-                transitions = self.transitions.detach().cpu().numpy()
-            else:
-                transitions = None
-
-            # make mini-batches
-            batches = [
-                filtered_sentences[x : x + mini_batch_size]
-                for x in range(0, len(filtered_sentences), mini_batch_size)
-            ]
-
-            # progress bar for verbosity
-            if verbose:
-                batches = tqdm(batches)
-
-            for i, batch in enumerate(batches):
-
-                if verbose:
-                    batches.set_description(f"Inferencing on batch {i}")
-
-                feature: torch.Tensor = self.forward(batch)
-                tags, all_tags = self._obtain_labels(
-                    feature=feature,
-                    batch_sentences=batch,
-                    transitions=transitions,
-                    get_all_tags=all_tag_prob,
-                )
-
-                for (sentence, sent_tags) in zip(batch, tags):
-                    for (token, tag) in zip(sentence.tokens, sent_tags):
-                        token.add_tag_label(self.tag_type, tag)
-
-                # all_tags will be empty if all_tag_prob is set to False, so the for loop will be avoided
-                for (sentence, sent_all_tags) in zip(batch, all_tags):
-                    for (token, token_all_tags) in zip(sentence.tokens, sent_all_tags):
-                        token.add_tags_proba_dist(self.tag_type, token_all_tags)
-
-                # clearing token embeddings to save memory
-                store_embeddings(batch, storage_mode=embedding_storage_mode)
-
-            return sentences
-
     def forward(self, sentences: List[Sentence]):
-        self.zero_grad()
 
         self.embeddings.embed(sentences)
 
@@ -460,7 +508,9 @@ class SequenceTagger(flair.nn.Model):
 
         all_embs = list()
         for sentence in sentences:
-            all_embs += [emb for token in sentence for emb in token.get_each_embedding()]
+            all_embs += [
+                emb for token in sentence for emb in token.get_each_embedding()
+            ]
             nb_padding_tokens = longest_token_sequence_in_batch - len(sentence)
 
             if nb_padding_tokens > 0:
@@ -588,9 +638,8 @@ class SequenceTagger(flair.nn.Model):
                 features, tag_list, lengths
             ):
                 sentence_feats = sentence_feats[:sentence_length]
-
                 score += torch.nn.functional.cross_entropy(
-                    sentence_feats, sentence_tags
+                    sentence_feats, sentence_tags, weight=self.loss_weights
                 )
             score /= len(features)
             return score
@@ -716,17 +765,19 @@ class SequenceTagger(flair.nn.Model):
             for index, (tag_id, tag_scores) in enumerate(zip(best_path, all_scores_np)):
                 if type(tag_id) != int and tag_id.item() != tag_scores.argmax():
                     swap_index_score = tag_scores.argmax()
-                    all_scores_np[index][tag_id.item()], all_scores_np[index][
-                        swap_index_score
-                    ] = (
+                    (
+                        all_scores_np[index][tag_id.item()],
+                        all_scores_np[index][swap_index_score],
+                    ) = (
                         all_scores_np[index][swap_index_score],
                         all_scores_np[index][tag_id.item()],
                     )
                 elif type(tag_id) == int and tag_id != tag_scores.argmax():
                     swap_index_score = tag_scores.argmax()
-                    all_scores_np[index][tag_id], all_scores_np[index][
-                        swap_index_score
-                    ] = (
+                    (
+                        all_scores_np[index][tag_id],
+                        all_scores_np[index][swap_index_score],
+                    ) = (
                         all_scores_np[index][swap_index_score],
                         all_scores_np[index][tag_id],
                     )
@@ -791,12 +842,20 @@ class SequenceTagger(flair.nn.Model):
         filtered_sentences = [sentence for sentence in sentences if sentence.tokens]
         if len(sentences) != len(filtered_sentences):
             log.warning(
-                "Ignore {} sentence(s) with no tokens.".format(
-                    len(sentences) - len(filtered_sentences)
-                )
+                f"Ignore {len(sentences) - len(filtered_sentences)} sentence(s) with no tokens."
             )
         return filtered_sentences
 
+    @staticmethod
+    def _filter_empty_string(texts: List[str]) -> List[str]:
+        filtered_texts = [text for text in texts if text]
+        if len(texts) != len(filtered_texts):
+            log.warning(
+                f"Ignore {len(texts) - len(filtered_texts)} string(s) with no tokens."
+            )
+        return filtered_texts
+
+    @staticmethod
     def _fetch_model(model_name) -> str:
 
         model_map = {}
@@ -914,6 +973,14 @@ class SequenceTagger(flair.nn.Model):
             ]
         )
 
+        model_map["da-pos"] = "/".join(
+            [aws_resource_path_v04, "POS-danish", "da-pos-v0.1.pt"]
+        )
+
+        model_map["da-ner"] = "/".join(
+            [aws_resource_path_v04, "NER-danish", "da-ner-v0.1.pt"]
+        )
+
         model_map["de-pos"] = "/".join(
             [aws_resource_path_v04, "release-de-pos-0", "de-pos-ud-hdt-v0.4.pt"]
         )
@@ -959,3 +1026,9 @@ class SequenceTagger(flair.nn.Model):
                 data.append(row)
             data.append(["----"])
         print(tabulate(data, headers=["FROM", "TO", "SCORE"]))
+
+    def __str__(self):
+        return super(flair.nn.Model, self).__str__().rstrip(')') + \
+               f'  (beta): {self.beta}\n' + \
+               f'  (weights): {self.weight_dict}\n' + \
+               f'  (weight_tensor) {self.loss_weights}\n)'

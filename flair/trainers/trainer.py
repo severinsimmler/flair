@@ -2,9 +2,9 @@ import logging
 from pathlib import Path
 from typing import List, Union
 import time
-import sys
-
 import datetime
+import sys
+import inspect
 
 import torch
 from torch.optim.lr_scheduler import ReduceLROnPlateau
@@ -29,6 +29,8 @@ from flair.training_utils import (
     Result,
     store_embeddings,
 )
+from flair.models import SequenceTagger
+import random
 
 log = logging.getLogger("flair")
 
@@ -61,7 +63,7 @@ class ModelTrainer:
         base_path: Union[Path, str],
         learning_rate: float = 0.1,
         mini_batch_size: int = 32,
-        eval_mini_batch_size: int = None,
+        mini_batch_chunk_size: int = None,
         max_epochs: int = 100,
         anneal_factor: float = 0.5,
         patience: int = 3,
@@ -73,12 +75,15 @@ class ModelTrainer:
         checkpoint: bool = False,
         save_final_model: bool = True,
         anneal_with_restarts: bool = False,
+        batch_growth_annealing: bool = False,
         shuffle: bool = True,
         param_selection_mode: bool = False,
         num_workers: int = 6,
         sampler=None,
         use_amp: bool = False,
         amp_opt_level: str = "O1",
+        eval_on_train_fraction=0.0,
+        eval_on_train_shuffle=False,
         **kwargs,
     ) -> dict:
         """
@@ -86,7 +91,7 @@ class ModelTrainer:
         :param base_path: Main path to which all output during training is logged and models are saved
         :param learning_rate: Initial learning rate
         :param mini_batch_size: Size of mini-batches during training
-        :param eval_mini_batch_size: Size of mini-batches during evaluation
+        :param mini_batch_chunk_size: If mini-batches are larger than this number, they get broken down into chunks of this size for processing purposes
         :param max_epochs: Maximum number of epochs to train. Terminates training if this number is surpassed.
         :param anneal_factor: The factor by which the learning rate is annealed
         :param patience: Patience is the number of epochs with no improvement the Trainer waits
@@ -105,6 +110,11 @@ class ModelTrainer:
         parameter selection.
         :param num_workers: Number of workers in your data loader.
         :param sampler: You can pass a data sampler here for special sampling of data.
+        :param eval_on_train_fraction: the fraction of train data to do the evaluation on,
+        if 0. the evaluation is not performed on fraction of training data,
+        if 'dev' the size is determined from dev set size
+        :param eval_on_train_shuffle: if True the train data fraction is determined on the start of training
+        and kept fixed during training, otherwise it's sampled at beginning of each epoch
         :param kwargs: Other arguments for the Optimizer
         :return:
         """
@@ -132,8 +142,8 @@ class ModelTrainer:
                     "to enable mixed-precision training."
                 )
 
-        if eval_mini_batch_size is None:
-            eval_mini_batch_size = mini_batch_size
+        if mini_batch_chunk_size is None:
+            mini_batch_chunk_size = mini_batch_size
 
         # cast string to Path
         if type(base_path) is str:
@@ -154,12 +164,16 @@ class ModelTrainer:
         log.info(f' - max_epochs: "{max_epochs}"')
         log.info(f' - shuffle: "{shuffle}"')
         log.info(f' - train_with_dev: "{train_with_dev}"')
+        log.info(f' - batch_growth_annealing: "{batch_growth_annealing}"')
         log_line(log)
         log.info(f'Model training base path: "{base_path}"')
         log_line(log)
         log.info(f"Device: {flair.device}")
         log_line(log)
         log.info(f"Embeddings storage mode: {embeddings_storage_mode}")
+        if isinstance(self.model, SequenceTagger) and self.model.weight_dict and self.model.use_crf:
+            log_line(log)
+            log.warning(f'WARNING: Specified class weights will not take effect when using CRF')
 
         # determine what splits (train, dev, test) to evaluate and log
         log_train = True if monitor_train else False
@@ -169,6 +183,24 @@ class ModelTrainer:
             else False
         )
         log_dev = True if not train_with_dev else False
+        log_train_part = (
+            True
+            if (eval_on_train_fraction == "dev" or eval_on_train_fraction > 0.0)
+            else False
+        )
+
+        if log_train_part:
+            train_part_size = (
+                len(self.corpus.dev)
+                if eval_on_train_fraction == "dev"
+                else int(len(self.corpus.train) * eval_on_train_fraction)
+            )
+            assert train_part_size > 0
+            if not eval_on_train_shuffle:
+                train_part_indices = list(range(train_part_size))
+                train_part = torch.utils.data.dataset.Subset(
+                    self.corpus.train, train_part_indices
+                )
 
         # prepare loss logging file and set up header
         loss_txt = init_output_file(base_path, "loss.tsv")
@@ -201,13 +233,20 @@ class ModelTrainer:
         if train_with_dev:
             train_data = ConcatDataset([self.corpus.train, self.corpus.dev])
 
+        # initialize sampler if provided
         if sampler is not None:
-            sampler = sampler(train_data)
+            # init with default values if only class is provided
+            if inspect.isclass(sampler):
+                sampler = sampler()
+            # set dataset to sample from
+            sampler.set_dataset(train_data)
             shuffle = False
 
         dev_score_history = []
         dev_loss_history = []
         train_loss_history = []
+
+        micro_batch_size = mini_batch_chunk_size
 
         # At any point you can hit Ctrl + C to break out of training early.
         try:
@@ -216,9 +255,20 @@ class ModelTrainer:
             for self.epoch in range(self.epoch + 1, max_epochs + 1):
                 log_line(log)
 
+                if eval_on_train_shuffle:
+                    train_part_indices = list(range(self.corpus.train))
+                    random.shuffle(train_part_indices)
+                    train_part_indices = train_part_indices[:train_part_size]
+                    train_part = torch.utils.data.dataset.Subset(
+                        self.corpus.train, train_part_indices
+                    )
+
                 # get new learning rate
                 for group in optimizer.param_groups:
                     learning_rate = group["lr"]
+
+                if learning_rate != previous_learning_rate and batch_growth_annealing:
+                    mini_batch_size *= 2
 
                 # reload last best model if annealing with restarts is enabled
                 if (
@@ -261,16 +311,33 @@ class ModelTrainer:
                 batch_time = 0
                 for batch_no, batch in enumerate(batch_loader):
                     start_time = time.time()
-                    loss = self.model.forward_loss(batch)
 
+                    # zero the gradients on the model and optimizer
+                    self.model.zero_grad()
                     optimizer.zero_grad()
-                    # Backward
-                    if use_amp:
-                        with amp.scale_loss(loss, optimizer) as scaled_loss:
-                            scaled_loss.backward()
-                    else:
-                        loss.backward()
 
+                    # if necessary, make batch_steps
+                    batch_steps = [batch]
+                    if len(batch) > micro_batch_size:
+                        batch_steps = [
+                            batch[x : x + micro_batch_size]
+                            for x in range(0, len(batch), micro_batch_size)
+                        ]
+
+                    # forward and backward for batch
+                    for batch_step in batch_steps:
+
+                        # forward pass
+                        loss = self.model.forward_loss(batch_step)
+
+                        # Backward
+                        if use_amp:
+                            with amp.scale_loss(loss, optimizer) as scaled_loss:
+                                scaled_loss.backward()
+                        else:
+                            loss.backward()
+
+                    # do the optimizer step
                     torch.nn.utils.clip_grad_norm_(self.model.parameters(), 5.0)
                     optimizer.step()
 
@@ -281,9 +348,9 @@ class ModelTrainer:
                     store_embeddings(batch, embeddings_storage_mode)
 
                     batch_time += time.time() - start_time
-                    if batch_no % modulo == 0:
+                    if seen_batches % modulo == 0:
                         log.info(
-                            f"epoch {self.epoch} - iter {batch_no}/{total_number_of_batches} - loss "
+                            f"epoch {self.epoch} - iter {seen_batches}/{total_number_of_batches} - loss "
                             f"{train_loss / seen_batches:.8f} - samples/sec: {mini_batch_size * modulo / batch_time:.2f}"
                         )
                         batch_time = 0
@@ -315,7 +382,7 @@ class ModelTrainer:
                     train_eval_result, train_loss = self.model.evaluate(
                         DataLoader(
                             self.corpus.train,
-                            batch_size=eval_mini_batch_size,
+                            batch_size=mini_batch_chunk_size,
                             num_workers=num_workers,
                         ),
                         embedding_storage_mode=embeddings_storage_mode,
@@ -325,11 +392,27 @@ class ModelTrainer:
                     # depending on memory mode, embeddings are moved to CPU, GPU or deleted
                     store_embeddings(self.corpus.train, embeddings_storage_mode)
 
+                if log_train_part:
+                    train_part_eval_result, train_part_loss = self.model.evaluate(
+                        DataLoader(
+                            train_part,
+                            batch_size=mini_batch_chunk_size,
+                            num_workers=num_workers,
+                        ),
+                        embedding_storage_mode=embeddings_storage_mode,
+                    )
+                    result_line += (
+                        f"\t{train_part_loss}\t{train_part_eval_result.log_line}"
+                    )
+                    log.info(
+                        f"TRAIN_SPLIT : loss {train_part_loss} - score {train_part_eval_result.main_score}"
+                    )
+
                 if log_dev:
                     dev_eval_result, dev_loss = self.model.evaluate(
                         DataLoader(
                             self.corpus.dev,
-                            batch_size=eval_mini_batch_size,
+                            batch_size=mini_batch_chunk_size,
                             num_workers=num_workers,
                         ),
                         embedding_storage_mode=embeddings_storage_mode,
@@ -358,7 +441,7 @@ class ModelTrainer:
                     test_eval_result, test_loss = self.model.evaluate(
                         DataLoader(
                             self.corpus.test,
-                            batch_size=eval_mini_batch_size,
+                            batch_size=mini_batch_chunk_size,
                             num_workers=num_workers,
                         ),
                         base_path / "test.tsv",
@@ -412,6 +495,13 @@ class ModelTrainer:
                                     train_eval_result.log_header.split("\t")
                                 )
                             )
+                        if log_train_part:
+                            f.write(
+                                "\tTRAIN_PART_LOSS\tTRAIN_PART_"
+                                + "\tTRAIN_PART_".join(
+                                    train_part_eval_result.log_header.split("\t")
+                                )
+                            )
                         if log_dev:
                             f.write(
                                 "\tDEV_LOSS\tDEV_"
@@ -460,7 +550,7 @@ class ModelTrainer:
 
         # test best model if test data is present
         if self.corpus.test:
-            final_score = self.final_test(base_path, eval_mini_batch_size, num_workers)
+            final_score = self.final_test(base_path, mini_batch_chunk_size, num_workers)
         else:
             final_score = 0
             log.info("Test data not provided setting final score to 0")

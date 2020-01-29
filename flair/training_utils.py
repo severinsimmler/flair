@@ -11,7 +11,6 @@ from flair.data import Dictionary, Sentence
 from functools import reduce
 from sklearn.metrics import mean_squared_error, mean_absolute_error
 from scipy.stats import pearsonr, spearmanr
-from abc import abstractmethod
 
 
 class Result(object):
@@ -25,8 +24,9 @@ class Result(object):
 
 
 class Metric(object):
-    def __init__(self, name):
+    def __init__(self, name, beta=1):
         self.name = name
+        self.beta = beta
 
         self._tps = defaultdict(int)
         self._fps = defaultdict(int)
@@ -86,9 +86,9 @@ class Metric(object):
     def f_score(self, class_name=None):
         if self.precision(class_name) + self.recall(class_name) > 0:
             return round(
-                2
+                (1 + self.beta*self.beta)
                 * (self.precision(class_name) * self.recall(class_name))
-                / (self.precision(class_name) + self.recall(class_name)),
+                / (self.precision(class_name) * self.beta*self.beta + self.recall(class_name)),
                 4,
             )
         return 0.0

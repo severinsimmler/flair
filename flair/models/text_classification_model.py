@@ -1,16 +1,16 @@
-import math
-import warnings
 import logging
 from pathlib import Path
-from typing import List, Union
+from typing import List, Union, Callable, Dict
 
 import torch
 import torch.nn as nn
+from torch.utils.data import DataLoader
+from tqdm import tqdm
 
 import flair.nn
 import flair.embeddings
-from flair.data import Dictionary, Sentence, Label
-from flair.datasets import DataLoader
+from flair.data import Dictionary, Sentence, Label, Token, space_tokenizer
+from flair.datasets import SentenceDataset, StringDataset
 from flair.file_utils import cached_path
 from flair.training_utils import (
     convert_labels_to_one_hot,
@@ -36,6 +36,8 @@ class TextClassifier(flair.nn.Model):
         label_dictionary: Dictionary,
         multi_label: bool = None,
         multi_label_threshold: float = 0.5,
+        beta: float = 1.0,
+        loss_weights: Dict[str, float] = None,
     ):
         """
         Initializes a TextClassifier
@@ -44,6 +46,9 @@ class TextClassifier(flair.nn.Model):
         :param multi_label: auto-detected by default, but you can set this to True to force multi-label prediction
         or False to force single-label prediction
         :param multi_label_threshold: If multi-label you can set the threshold to make predictions
+        :param beta: Parameter for F-beta score for evaluation and training annealing
+        :param loss_weights: Dictionary of weights for labels for the loss function
+        (if any label's weight is unspecified it will default to 1.0)
         """
 
         super(TextClassifier, self).__init__()
@@ -58,6 +63,20 @@ class TextClassifier(flair.nn.Model):
 
         self.multi_label_threshold = multi_label_threshold
 
+        self.beta = beta
+
+        self.weight_dict = loss_weights
+        # Initialize the weight tensor
+        if loss_weights is not None:
+            n_classes = len(self.label_dictionary)
+            weight_list = [1. for i in range(n_classes)]
+            for i, tag in enumerate(self.label_dictionary.get_items()):
+                if tag in loss_weights.keys():
+                    weight_list[i] = loss_weights[tag]
+            self.loss_weights = torch.FloatTensor(weight_list).to(flair.device)
+        else:
+            self.loss_weights = None
+
         self.decoder = nn.Linear(
             self.document_embeddings.embedding_length, len(self.label_dictionary)
         )
@@ -65,9 +84,9 @@ class TextClassifier(flair.nn.Model):
         self._init_weights()
 
         if self.multi_label:
-            self.loss_function = nn.BCEWithLogitsLoss()
+            self.loss_function = nn.BCEWithLogitsLoss(weight=self.loss_weights)
         else:
-            self.loss_function = nn.CrossEntropyLoss()
+            self.loss_function = nn.CrossEntropyLoss(weight=self.loss_weights)
 
         # auto-spawn on GPU if available
         self.to(flair.device)
@@ -94,15 +113,22 @@ class TextClassifier(flair.nn.Model):
             "document_embeddings": self.document_embeddings,
             "label_dictionary": self.label_dictionary,
             "multi_label": self.multi_label,
+            "beta": self.beta,
+            "weight_dict": self.weight_dict,
         }
         return model_state
 
+    @staticmethod
     def _init_model_with_state_dict(state):
+        beta = 1.0 if "beta" not in state.keys() else state["beta"]
+        weights = None if "weight_dict" not in state.keys() else state["weight_dict"]
 
         model = TextClassifier(
             document_embeddings=state["document_embeddings"],
             label_dictionary=state["label_dictionary"],
             multi_label=state["multi_label"],
+            beta=beta,
+            loss_weights=weights,
         )
 
         model.load_state_dict(state["state_dict"])
@@ -125,10 +151,12 @@ class TextClassifier(flair.nn.Model):
 
     def predict(
         self,
-        sentences: Union[Sentence, List[Sentence]],
+        sentences: Union[List[Sentence], Sentence, List[str], str],
         mini_batch_size: int = 32,
         embedding_storage_mode="none",
         multi_class_prob: bool = False,
+        verbose: bool = False,
+        use_tokenizer: Union[bool, Callable[[str], List[Token]]] = space_tokenizer,
     ) -> List[Sentence]:
         """
         Predicts the class labels for the given sentences. The labels are directly added to the sentences.
@@ -137,23 +165,62 @@ class TextClassifier(flair.nn.Model):
         :param embedding_storage_mode: 'none' for the minimum memory footprint, 'cpu' to store embeddings in Ram,
         'gpu' to store embeddings in GPU memory.
         :param multi_class_prob : return probability for all class for multiclass
+        :param verbose: set to True to display a progress bar
+        :param use_tokenizer: a custom tokenizer when string are provided (default is space based tokenizer).
         :return: the list of sentences containing the labels
         """
         with torch.no_grad():
-            if type(sentences) is Sentence:
+            if not sentences:
+                return sentences
+
+            if isinstance(sentences, Sentence) or isinstance(sentences, str):
                 sentences = [sentences]
 
-            filtered_sentences = self._filter_empty_sentences(sentences)
+            if (flair.device.type == "cuda") and embedding_storage_mode == "cpu":
+                log.warning(
+                    "You are inferring on GPU with parameter 'embedding_storage_mode' set to 'cpu'."
+                    "This option will slow down your inference, usually 'none' (default value) "
+                    "is a better choice."
+                )
 
-            # remove previous embeddings
-            store_embeddings(filtered_sentences, "none")
+            # reverse sort all sequences by their length
+            rev_order_len_index = sorted(
+                range(len(sentences)), key=lambda k: len(sentences[k]), reverse=True
+            )
+            original_order_index = sorted(
+                range(len(rev_order_len_index)), key=lambda k: rev_order_len_index[k]
+            )
 
-            batches = [
-                filtered_sentences[x : x + mini_batch_size]
-                for x in range(0, len(filtered_sentences), mini_batch_size)
+            reordered_sentences: List[Union[Sentence, str]] = [
+                sentences[index] for index in rev_order_len_index
             ]
 
-            for batch in batches:
+            if isinstance(sentences[0], Sentence):
+                # remove previous embeddings
+                store_embeddings(reordered_sentences, "none")
+                dataset = SentenceDataset(reordered_sentences)
+            else:
+                dataset = StringDataset(
+                    reordered_sentences, use_tokenizer=use_tokenizer
+                )
+            dataloader = DataLoader(
+                dataset=dataset, batch_size=mini_batch_size, collate_fn=lambda x: x
+            )
+
+            # progress bar for verbosity
+            if verbose:
+                dataloader = tqdm(dataloader)
+
+            results: List[Sentence] = []
+            for i, batch in enumerate(dataloader):
+                if verbose:
+                    dataloader.set_description(f"Inferencing on batch {i}")
+                results += batch
+                batch = self._filter_empty_sentences(batch)
+                # stop if all sentences are empty
+                if not batch:
+                    continue
+
                 scores = self.forward(batch)
                 predicted_labels = self._obtain_labels(
                     scores, predict_prob=multi_class_prob
@@ -165,7 +232,11 @@ class TextClassifier(flair.nn.Model):
                 # clearing token embeddings to save memory
                 store_embeddings(batch, storage_mode=embedding_storage_mode)
 
-            return sentences
+            results: List[Union[Sentence, str]] = [
+                results[index] for index in original_order_index
+            ]
+            assert len(sentences) == len(results)
+            return results
 
     def evaluate(
         self,
@@ -177,7 +248,7 @@ class TextClassifier(flair.nn.Model):
         with torch.no_grad():
             eval_loss = 0
 
-            metric = Metric("Evaluation")
+            metric = Metric("Evaluation", beta=self.beta)
 
             lines: List[str] = []
             batch_count: int = 0
@@ -370,6 +441,7 @@ class TextClassifier(flair.nn.Model):
 
         return vec
 
+    @staticmethod
     def _fetch_model(model_name) -> str:
 
         model_map = {}
@@ -394,3 +466,9 @@ class TextClassifier(flair.nn.Model):
             model_name = cached_path(model_map[model_name], cache_dir=cache_dir)
 
         return model_name
+
+    def __str__(self):
+        return super(flair.nn.Model, self).__str__().rstrip(')') + \
+               f'  (beta): {self.beta}\n' + \
+               f'  (weights): {self.weight_dict}\n' + \
+               f'  (weight_tensor) {self.loss_weights}\n)'
